@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+docker-compose.ti.yml
+README.ti.md
+example-litellm.py

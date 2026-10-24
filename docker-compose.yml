@@ -1,0 +1,16 @@
+services:
+  pgvector:
+    # Replace with your Artifactory URL, e.g.:
+    # artifactory.itg.ti.com/docker-public/python:3.11.11-slim-bookworm
+    image: pgvector/pgvector:0.8.0-pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vectors
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
