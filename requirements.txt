@@ -3,3 +3,5 @@ httpx
 psycopg2-binary
 pgvector
 numpy
+sentence-transformers
+datasets

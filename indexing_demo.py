@@ -1,22 +1,57 @@
 """
 Demonstrates IVFFlat vs HNSW indexing in pgvector.
 
-Seeds the table with random vectors (no embedding API needed) so you can
-test index behaviour at realistic scale without hitting rate limits.
+Uses the AG News dataset (120k real news snippets across World, Sports,
+Business, and Sci/Tech) embedded with sentence-transformers so that nearest-
+neighbour structure reflects genuine semantic similarity — no synthetic data,
+no artificial clustering.
 
-No env vars required. Just: docker compose up -d && python indexing_demo.py
+First run downloads AG News (~10 MB) and all-MiniLM-L6-v2 (~80 MB) to
+~/.cache/huggingface. Subsequent runs use the local cache.
+
+Setup: docker compose up -d && pip install -r requirements.txt
+Run:   python indexing_demo.py
 """
 
 import time
-import numpy as np
 import psycopg2
 import psycopg2.extras
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
 from pgvector.psycopg2 import register_vector
 
 DB_URL    = "postgresql://postgres:postgres@localhost:5432/vectors"
-EMBED_DIM = 768
-N_ROWS    = 50_000   # increase to 200k+ for more pronounced timing differences
-BATCH     = 5_000    # rows per INSERT batch
+MODEL     = "all-MiniLM-L6-v2"
+EMBED_DIM = 384
+N_ROWS    = 10_000
+BATCH     = 256
+
+
+def load_corpus(n: int = N_ROWS, seed: int = 42) -> list[str]:
+    """Load n real news snippets from AG News, shuffled so all four categories
+    (World, Sports, Business, Sci/Tech) are represented evenly."""
+    dataset = load_dataset("fancyzhx/ag_news", split="train").shuffle(seed=seed)
+    return dataset.select(range(min(n, len(dataset))))["text"]
+
+
+def seed_real(conn, model: SentenceTransformer, n: int = N_ROWS):
+    corpus = load_corpus(n)
+
+    print(f"Encoding {n:,} news snippets...", flush=True)
+    t0 = time.perf_counter()
+    vecs = model.encode(corpus, batch_size=BATCH, show_progress_bar=True).tolist()
+    print(f"Encoded in {time.perf_counter() - t0:.1f}s.", flush=True)
+
+    print("Inserting...", flush=True)
+    t0 = time.perf_counter()
+    with conn.cursor() as cur:
+        for i in range(0, n, BATCH):
+            psycopg2.extras.execute_values(
+                cur, "INSERT INTO index_test (text, vec) VALUES %s",
+                list(zip(corpus[i:i+BATCH], vecs[i:i+BATCH]))
+            )
+    conn.commit()
+    print(f"Inserted {n:,} rows in {time.perf_counter() - t0:.1f}s.")
 
 
 def reset_table(conn):
@@ -32,26 +67,6 @@ def reset_table(conn):
         """)
     conn.commit()
     print("Table reset.")
-
-
-def seed_random(conn, n: int = N_ROWS):
-    """Insert n unit-normalized random vectors (no API calls)."""
-    rng = np.random.default_rng(42)
-    print(f"Seeding {n:,} random vectors...", flush=True)
-    t0 = time.perf_counter()
-    inserted = 0
-    with conn.cursor() as cur:
-        while inserted < n:
-            batch_size = min(BATCH, n - inserted)
-            vecs = rng.standard_normal((batch_size, EMBED_DIM)).astype(np.float32)
-            vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)  # unit normalize
-            rows = list(zip([f"doc_{inserted + i}" for i in range(batch_size)], vecs.tolist()))
-            psycopg2.extras.execute_values(
-                cur, "INSERT INTO index_test (text, vec) VALUES %s", rows
-            )
-            inserted += batch_size
-    conn.commit()
-    print(f"Done in {time.perf_counter() - t0:.1f}s.")
 
 
 def drop_index(conn):
@@ -82,10 +97,10 @@ def create_ivfflat(conn, lists: int = 10, probes: int = 3):
 
 # --- HNSW ---
 # Builds a multi-layer graph. No data required at index creation time.
-# m           = max connections per node (default 16, higher = better recall, more memory)
-# ef_construction = search width during build (default 64, higher = better recall, slower build)
-# ef_search   = search width at query time (session setting, default 40)
-def create_hnsw(conn, m: int = 16, ef_construction: int = 64, ef_search: int = 40):
+# m               = max connections per node (default 16)
+# ef_construction = search width during build (default 64)
+# ef_search       = search width at query time (session setting, default 40)
+def create_hnsw(conn, m: int = 16, ef_construction: int = 64, ef_search: int = 64):
     drop_index(conn)
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -97,14 +112,6 @@ def create_hnsw(conn, m: int = 16, ef_construction: int = 64, ef_search: int = 4
         cur.execute(f"SET hnsw.ef_search = {ef_search}")
     conn.commit()
     print(f"HNSW index created (m={m}, ef_construction={ef_construction}, ef_search={ef_search}).")
-
-
-def random_query_vec() -> list[float]:
-    """Generate a single unit-normalized random vector to use as a query."""
-    rng = np.random.default_rng()
-    v = rng.standard_normal(EMBED_DIM).astype(np.float32)
-    v /= np.linalg.norm(v)
-    return v.tolist()
 
 
 def timed_search(conn, vec: list[float], top_k: int = 5) -> float:
@@ -151,25 +158,36 @@ def benchmark(conn, label: str, vec: list[float], ground_truth: set[int], runs: 
 
 
 if __name__ == "__main__":
+    model = SentenceTransformer(MODEL)
+
     conn = psycopg2.connect(DB_URL)
     reset_table(conn)
     register_vector(conn)
-    seed_random(conn, N_ROWS)
+    seed_real(conn, model, N_ROWS)
 
-    vec = random_query_vec()
-    ground_truth = get_ground_truth(conn, vec)  # exact results before any index exists
+    query = "artificial intelligence breakthroughs in machine learning research"
+    vec = model.encode(query).tolist()
+    ground_truth = get_ground_truth(conn, vec)
 
     # --- IVFFlat ---
-    lists = max(1, int(N_ROWS ** 0.5))
-    probes = max(1, lists // 10)
+    # lists ≈ sqrt(N) is the standard starting point; probes = lists / 10
+    # scans 10% of clusters — reasonable recall without full table scan.
+    lists  = max(1, int(N_ROWS ** 0.5))   # 100 for 10k rows
+    probes = max(1, lists // 10)           # 10
     print(f"\n{'='*50}\nIVFFlat Index (lists={lists}, probes={probes})\n{'='*50}")
     create_ivfflat(conn, lists=lists, probes=probes)
     benchmark(conn, "IVFFlat", vec, ground_truth)
     explain_query(conn, vec)
 
     # --- HNSW ---
-    print(f"\n{'='*50}\nHNSW Index (m=16, ef_construction=64, ef_search=64)\n{'='*50}")
-    create_hnsw(conn, m=16, ef_construction=64, ef_search=64)
+    # ef_construction=128 builds a denser graph than the default 64 — worth it
+    # at 10k rows where build time is negligible.
+    # ef_search=100 explores more candidates at query time for higher recall.
+    m                = 16
+    ef_construction  = 128
+    ef_search        = 100
+    print(f"\n{'='*50}\nHNSW Index (m={m}, ef_construction={ef_construction}, ef_search={ef_search})\n{'='*50}")
+    create_hnsw(conn, m=m, ef_construction=ef_construction, ef_search=ef_search)
     benchmark(conn, "HNSW   ", vec, ground_truth)
     explain_query(conn, vec)
 

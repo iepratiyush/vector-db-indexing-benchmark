@@ -18,9 +18,10 @@ from pgvector.psycopg2 import register_vector
 from sentence_transformers import SentenceTransformer
 
 DB_URL    = "postgresql://postgres:postgres@localhost:5432/vectors"
+MODEL     = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer(MODEL)
 
 
 def get_embedding(text: str) -> list[float]:
@@ -39,7 +40,6 @@ def setup(conn):
         """)
         cur.execute("TRUNCATE TABLE items_st")
     conn.commit()
-
 
 
 def search(conn, query: str, top_k: int = 3):
